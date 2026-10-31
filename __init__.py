@@ -1,6 +1,6 @@
 """weftspun-manuals: the weftspun manuals site as read-only memory, beside holographic memory.
 
-Hermes allows ONE external MemoryProvider, and holographic holds that seat. This plugin is therefore a
+Hermes allows one external memory provider, and holographic holds that seat. This plugin is therefore a
 plain tool plugin plus a ``pre_llm_call`` recall hook: holographic keeps the writable facts, this keeps
 the published record (RFDs, logbook, working agreements, blocklist). Nothing is configurable: the site,
 the index file and the limits are constants below.
