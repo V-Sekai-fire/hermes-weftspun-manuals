@@ -5,6 +5,10 @@ plain tool plugin plus a ``pre_llm_call`` recall hook: holographic keeps the wri
 the published record (RFDs, logbook, working agreements, blocklist). Nothing is configurable: the site,
 the index file and the limits are constants below.
 
+Two layers read the same site. The BM25 index (this file) gates recall and answers `get`/`list`; the
+composed layer (composed.py) holds every passage as a read-only holographic fact with an HRR vector and
+entity links, and answers `search`, `probe`, `reason` and `related` through holographic's own retriever.
+
 Source: <BASE>search.json, the BM25 index the site's own search box loads (one entry per RFD, logbook
 entry and agreement page, with the full text in ``b``). Cached under $HERMES_HOME/cache/weftspun-manuals/.
 """
@@ -21,6 +25,8 @@ import urllib.request
 from collections import Counter
 from math import log
 from pathlib import Path
+
+from . import composed
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +119,7 @@ def _load(force: bool = False) -> dict:
             raise RuntimeError(f"manuals index unavailable ({err}); nothing cached")
         raw = json.loads(path.read_text(encoding="utf-8"))
         _index = _build(raw, path.stat().st_mtime)
+        _index["raw"] = raw
         _index["stale"] = err is not None
         return _index
 
@@ -167,7 +174,11 @@ SCHEMA = {
         "Read-only memory of the weftspun manuals (https://v-sekai-fire.github.io/manuals-weftspun/): RFDs "
         "(decisions, design docs), the logbook (measurements), the working agreements, the blocklist. Use with "
         "fact_store: fact_store = what the user told you, weftspun_manual = what the workspace published.\n"
-        "- search {query, kind?, limit?}: ranked hits with snippets and URLs. kind: rfd | log | page.\n"
+        "Every passage is also a read-only holographic fact (HRR vector, entity links), so queries compose.\n"
+        "- search {query, kind?, limit?}: best passage per document, with URL and a bm25 score (0 = weak). kind: rfd | log | page.\n"
+        "- probe {entity}: an RFD's own passages first, then every passage that mentions it (backlinks).\n"
+        "- reason {entities: [a, b, ...]}: passages that mention ALL of them (e.g. two RFD ids).\n"
+        "- related {entity}: passages structurally connected to a name, by HRR unbinding.\n"
         "- get {ref, offset?, max_chars?}: full text. ref: an RFD number ('2336' or 'RFD66606-2336'), a title "
         "fragment, or a path such as 'page-AGENTS.html' or 'logbook/<name>.html'.\n"
         "- list {kind?, status?, limit?}: titles and states (status is a substring of the state marks).\n"
@@ -177,7 +188,9 @@ SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "action": {"type": "string", "enum": ["search", "get", "list", "status", "refresh"]},
+            "action": {"type": "string", "enum": ["search", "probe", "reason", "related", "get", "list", "status", "refresh"]},
+            "entity": {"type": "string"},
+            "entities": {"type": "array", "items": {"type": "string"}},
             "query": {"type": "string"},
             "ref": {"type": "string"},
             "kind": {"type": "string", "enum": ["rfd", "log", "page"]},
@@ -213,6 +226,69 @@ def _resolve(idx: dict, ref: str):
     return None
 
 
+def _composed_ready(idx: dict) -> bool:
+    """True when the holographic mirror can answer; start its (slow, one-time) build in the background if not."""
+    if composed.retriever() is not None and composed.current(_cache_file().parent, idx["raw"]):
+        return True
+    if composed.current(_cache_file().parent, idx["raw"]):   # built already: opening it takes milliseconds
+        return composed.ensure(_cache_file().parent, idx["raw"])
+    if not composed.info()["building"]:
+        threading.Thread(target=composed.ensure, args=(_cache_file().parent, idx["raw"]),
+                         name="weftspun-manuals-mirror", daemon=True).start()
+    return False
+
+
+def _rows(facts: list, entity: str = "", limit: int = 8) -> list:
+    rows = [composed.view(f) for f in facts]
+    if entity:  # an RFD's own passages first, then the passages that mention it
+        rows.sort(key=lambda r: r["doc"].lower() != entity.lower())
+    return rows[:limit]
+
+
+def _composed_action(action: str, args: dict, idx: dict, limit: int, kind) -> str:
+    if not composed.available():
+        return json.dumps({"error": "holographic plugin not found; composed actions need it (search still works "
+                                    "through the BM25 index)"})
+    if not _composed_ready(idx):
+        return json.dumps({"error": "composed mirror is building (about two minutes, once per site change); "
+                                    "retry shortly", **composed.info()})
+    r = composed.retriever()
+    cat = {"rfd": "rfd", "log": "logbook", "page": "agreement"}.get(kind)
+    if action == "probe":
+        ent = str(args.get("entity") or args.get("query") or "").strip()
+        if not ent:
+            return json.dumps({"error": "'entity' is required (an RFD id such as RFD66606-2294, or a name)"})
+        facts = r.probe(ent, category=cat, limit=max(limit, 40))
+        return json.dumps({"entity": ent, "results": _rows(facts, ent, limit)}, ensure_ascii=False)
+    if action == "reason":
+        ents = [e for e in (args.get("entities") or []) if isinstance(e, str) and e.strip()]
+        if len(ents) < 2:
+            return json.dumps({"error": "'entities' needs two or more names"})
+        return json.dumps({"entities": ents, "results": _rows(r.reason(ents, category=cat, limit=limit))},
+                          ensure_ascii=False)
+    if action == "related":
+        ent = str(args.get("entity") or args.get("query") or "").strip()
+        if not ent:
+            return json.dumps({"error": "'entity' is required"})
+        return json.dumps({"entity": ent, "results": _rows(r.related(ent, category=cat, limit=limit))},
+                          ensure_ascii=False)
+    q = str(args.get("query") or "").strip()
+    if not q:
+        return json.dumps({"error": "'query' is required"})
+    terms = list(dict.fromkeys(_stem(w) for w in _words(q)))
+    bm = {d["u"]: s for s, d, _ in _score(idx, terms, kind)}
+    seen, rows = set(), []
+    for row in _rows(r.search(q, category=cat, limit=limit * 4), limit=limit * 4):
+        if row["url"] in seen:
+            continue
+        seen.add(row["url"])
+        row["bm25"] = round(bm.get(row["url"], 0.0), 2)   # 0 = no query word in the document: a weak match
+        rows.append(row)
+        if len(rows) == limit:
+            break
+    return json.dumps({"query": q, "results": rows}, ensure_ascii=False)
+
+
 def _handle(args: dict, **_kw) -> str:
     try:
         action = (args.get("action") or "search").lower()
@@ -221,8 +297,13 @@ def _handle(args: dict, **_kw) -> str:
         kind = args.get("kind")
         if action in ("status", "refresh"):
             c = Counter(d["k"] for d in idx["docs"])
+            if action == "refresh":
+                _composed_ready(idx)  # rebuilds the mirror only when the site content changed
             return json.dumps({"source": BASE, "entries": dict(c), "total": len(idx["docs"]),
-                               "cache_age_s": int(time.time() - idx["loaded"]), "stale": idx.get("stale", False)})
+                               "cache_age_s": int(time.time() - idx["loaded"]), "stale": idx.get("stale", False),
+                               "composed": composed.info()})
+        if action in ("probe", "reason", "related"):
+            return _composed_action(action, args, idx, limit, kind)
         if action == "list":
             st = args.get("status") or ""
             rows = [d for d in idx["docs"] if (not kind or d["k"] == kind) and st in (d.get("s") or "")]
@@ -242,6 +323,8 @@ def _handle(args: dict, **_kw) -> str:
                                "url": _url(d), "total_chars": len(body), "offset": off,
                                "next_offset": off + mx if off + mx < len(body) else None,
                                "text": body[off:off + mx]}, ensure_ascii=False)
+        if action == "search" and _composed_ready(idx):
+            return _composed_action("search", args, idx, limit, kind)
         if action == "search":
             q = str(args.get("query") or "").strip()
             terms = list(dict.fromkeys(_stem(w) for w in _words(q)))
@@ -282,12 +365,19 @@ def _recall(user_message=None, session_id: str = "", **_kw):
                 break
         if not picks:
             return None
+        passages = {}
+        if composed.retriever() is not None and composed.current(_cache_file().parent, idx["raw"]):
+            want = {d["u"] for d in picks}
+            for f in composed.retriever().search(text, limit=60):
+                v = composed.view(f)
+                if v["url"] in want and v["url"] not in passages:
+                    passages[v["url"]] = re.sub(r"^.*?, part \d+ of \d+: ", "", v["passage"], count=1)[:RECALL_SNIPPET]
         lines = ['<weftspun-manuals source="' + BASE + '">',
                  "Published record (read-only; holographic facts may be newer). Fetch more with "
                  "weftspun_manual get {ref}."]
         for d in picks:
             seen[d["u"]] = turn
-            lines.append(f"- {_label(d)} {_url(d)}\n  {_snippet(d, terms)}")
+            lines.append(f"- {_label(d)} {_url(d)}\n  {passages.get(d['u']) or _snippet(d, terms)}")
         lines.append("</weftspun-manuals>")
         return {"context": "\n".join(lines)}
     except Exception as e:  # recall must never break a turn
@@ -297,7 +387,9 @@ def _recall(user_message=None, session_id: str = "", **_kw):
 
 def _warm() -> None:
     try:
-        _load()
+        idx = _load()
+        if composed.available():
+            composed.ensure(_cache_file().parent, idx["raw"])
     except Exception as e:
         logger.warning("weftspun-manuals warm-up failed: %s", e)
 
