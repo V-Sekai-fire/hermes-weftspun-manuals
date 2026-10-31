@@ -1,0 +1,9 @@
+manifest_version: 1
+name: weftspun-manuals
+version: 0.1.1
+description: "Read-only memory over the weftspun manuals (RFDs, logbook, working agreements) at https://v-sekai-fire.github.io/manuals-weftspun/, hardcoded, beside the holographic provider. Tool: weftspun_manual (search, get, list, status, refresh). Hook: pre_llm_call recall."
+author: "K. S. Ernest (iFire) Lee"
+provides_tools:
+  - weftspun_manual
+provides_hooks:
+  - pre_llm_call
